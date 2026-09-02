@@ -1402,6 +1402,10 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 
 struct ggml_backend_cuda_kv_stream_runtime {
     int device = 0;
+    // Per-device name: llama.cpp keys its KV ggml_context map on the buffer type
+    // NAME (ggml_backend_buft_comparator), so a shared constant would collapse the
+    // pools of every device into one buffer.
+    char name[64] = {};
     size_t stage_bytes = 0;
     uint32_t stage_slots = 0;
     size_t pool_bytes = 0;
@@ -1440,8 +1444,7 @@ static void ggml_backend_cuda_kv_stream_runtime_release(
 }
 
 static const char * ggml_backend_cuda_kv_stream_buffer_type_name(ggml_backend_buffer_type_t buft) {
-    GGML_UNUSED(buft);
-    return GGML_CUDA_NAME "_KV_Stream_Host";
+    return static_cast<ggml_backend_cuda_kv_stream_runtime_t>(buft->context)->name;
 }
 
 static bool ggml_backend_buft_is_cuda_kv_stream(ggml_backend_buffer_type_t buft) {
@@ -1576,6 +1579,8 @@ ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(
     }
 
     auto * runtime = new ggml_backend_cuda_kv_stream_runtime;
+    snprintf(runtime->name, sizeof(runtime->name), "%s%d_KV_Stream_Host",
+        GGML_CUDA_NAME, params.device);
     runtime->device      = params.device;
     runtime->stage_bytes = params.stage_bytes;
     runtime->stage_slots = params.stage_slots;
