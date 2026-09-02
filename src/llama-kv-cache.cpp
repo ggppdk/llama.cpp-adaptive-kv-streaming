@@ -163,13 +163,27 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
-    ggml_backend_dev_t kv_stream_dev = nullptr;
-    ggml_backend_buffer_type_t kv_stream_buft = nullptr;
+    // Block KV streaming keeps one pool per device. Count the streamed layers
+    // on each device up front so every pool is sized for the layers it hosts.
+    std::vector<ggml_backend_dev_t> kv_stream_devs;
+    std::vector<uint32_t>           kv_stream_dev_layers;
     uint32_t kv_stream_layer_count = 0;
     if (kv_stream_stage_bytes != 0) {
         for (uint32_t il = 0; il < n_layer; ++il) {
-            if (hparams.has_kv(il) && (!filter || filter(il))) {
-                ++kv_stream_layer_count;
+            if (!hparams.has_kv(il) || (filter && !filter(il))) {
+                continue;
+            }
+            ++kv_stream_layer_count;
+            if (!offload) {
+                continue;
+            }
+            auto * dev = model.dev_layer(il);
+            const auto it = std::find(kv_stream_devs.begin(), kv_stream_devs.end(), dev);
+            if (it == kv_stream_devs.end()) {
+                kv_stream_devs.push_back(dev);
+                kv_stream_dev_layers.push_back(1);
+            } else {
+                ++kv_stream_dev_layers[it - kv_stream_devs.begin()];
             }
         }
     }
@@ -232,11 +246,15 @@ llama_kv_cache::llama_kv_cache(
             dev_name = ggml_backend_dev_name(dev);
 
             if (kv_stream_stage_bytes != 0 && !hparams.no_alloc) {
-                if (kv_stream_dev != nullptr && kv_stream_dev != dev) {
-                    throw std::runtime_error("block KV streaming requires every attention layer on one CUDA device");
+                kv_stream_runtime_owner * kv_stream_owner = nullptr;
+                for (const auto & candidate : kv_stream_runtimes) {
+                    if (candidate->device == dev) {
+                        kv_stream_owner = candidate.get();
+                        break;
+                    }
                 }
 
-                if (kv_stream_runtime.runtime == nullptr) {
+                if (kv_stream_owner == nullptr) {
                     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                     using type_pair_supported_fn_t = bool (*)(ggml_type, ggml_type);
                     using page_bytes_fn_t = bool (*)(
@@ -308,28 +326,48 @@ llama_kv_cache::llama_kv_cache(
                             256, &conversion_bytes)) {
                         throw std::runtime_error("invalid block KV streaming conversion workspace geometry");
                     }
-                    kv_stream_runtime.runtime = runtime_new_fn(
-                        dev, kv_stream_stage_bytes, page_bytes, conversion_bytes, kv_stream_layer_count);
-                    kv_stream_runtime.free_fn = runtime_free_fn;
-                    kv_stream_runtime.feedback_fn = feedback_fn;
-                    kv_stream_runtime.span_feedback_fn = span_feedback_fn;
-                    kv_stream_runtime.repartition_fn = repartition_fn;
-                    kv_stream_runtime.reconfigure_fn = reconfigure_fn;
-                    kv_stream_runtime.decode_layout_fn = decode_layout_fn;
-                    kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
-                    kv_stream_runtime.layer_count = kv_stream_layer_count;
-                    if (kv_stream_runtime.runtime == nullptr) {
+                    const auto dev_it = std::find(
+                        kv_stream_devs.begin(), kv_stream_devs.end(), dev);
+                    GGML_ASSERT(dev_it != kv_stream_devs.end());
+                    const uint32_t dev_layer_count =
+                        kv_stream_dev_layers[dev_it - kv_stream_devs.begin()];
+
+                    // Each device gets the share of the pool matching the number of
+                    // layers it hosts, which keeps resident pages per layer even
+                    // across GPUs regardless of how the layers were split.
+                    const size_t dev_stage_bytes = (size_t)
+                        ((uint64_t) kv_stream_stage_bytes*dev_layer_count/kv_stream_layer_count);
+
+                    auto holder = std::make_unique<kv_stream_runtime_owner>();
+                    kv_stream_owner = holder.get();
+                    kv_stream_owner->device = dev;
+                    kv_stream_owner->runtime = runtime_new_fn(
+                        dev, dev_stage_bytes, page_bytes, conversion_bytes, dev_layer_count);
+                    kv_stream_owner->free_fn = runtime_free_fn;
+                    kv_stream_owner->feedback_fn = feedback_fn;
+                    kv_stream_owner->span_feedback_fn = span_feedback_fn;
+                    kv_stream_owner->repartition_fn = repartition_fn;
+                    kv_stream_owner->reconfigure_fn = reconfigure_fn;
+                    kv_stream_owner->decode_layout_fn = decode_layout_fn;
+                    kv_stream_owner->mark_dirty_rows_fn = mark_dirty_rows_fn;
+                    kv_stream_owner->layer_count = dev_layer_count;
+                    if (kv_stream_owner->runtime == nullptr) {
                         throw std::runtime_error("failed to create CUDA block KV streaming runtime");
                     }
 
-                    kv_stream_buft = buffer_type_fn(kv_stream_runtime.runtime);
-                    if (kv_stream_buft == nullptr) {
+                    kv_stream_owner->buft = buffer_type_fn(kv_stream_owner->runtime);
+                    if (kv_stream_owner->buft == nullptr) {
                         throw std::runtime_error("failed to obtain CUDA block KV streaming buffer type");
                     }
-                    kv_stream_dev = dev;
+
+                    LLAMA_LOG_INFO("%s: block KV streaming on %s: %u layers, pool = %.2f MiB\n",
+                            __func__, ggml_backend_dev_name(dev), dev_layer_count,
+                            dev_stage_bytes/1024.0/1024.0);
+
+                    kv_stream_runtimes.push_back(std::move(holder));
                 }
 
-                buft = kv_stream_buft;
+                buft = kv_stream_owner->buft;
                 dev_name = ggml_backend_buft_name(buft);
             }
         }
@@ -1319,7 +1357,17 @@ uint32_t llama_kv_cache::get_n_stream() const {
 }
 
 bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens) {
-    auto & owner = kv_stream_runtime;
+    // Every device owns an independent pool with its own resident/ring split,
+    // so they adapt independently. Report whether any of them repartitioned.
+    bool changed = false;
+    for (const auto & owner : kv_stream_runtimes) {
+        changed |= kv_stream_adapt_owner(*owner, active_tokens, query_tokens);
+    }
+    return changed;
+}
+
+bool llama_kv_cache::kv_stream_adapt_owner(
+        kv_stream_runtime_owner & owner, uint32_t active_tokens, uint32_t query_tokens) {
     if (owner.runtime == nullptr || owner.feedback_fn == nullptr ||
             owner.span_feedback_fn == nullptr || owner.reconfigure_fn == nullptr ||
             owner.layer_count == 0) {
@@ -1739,10 +1787,13 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         }
     }
 
-    if (kv_stream_runtime.runtime != nullptr) {
-        GGML_ASSERT(kv_stream_runtime.mark_dirty_rows_fn != nullptr);
-        GGML_ASSERT(kv_stream_runtime.mark_dirty_rows_fn(
-            kv_stream_runtime.runtime, data, n_tokens));
+    // The slot indices are the same on every device, so the rows written by this
+    // ubatch have to be marked dirty in each device's pool.
+    for (const auto & owner : kv_stream_runtimes) {
+        if (owner->runtime != nullptr) {
+            GGML_ASSERT(owner->mark_dirty_rows_fn != nullptr);
+            GGML_ASSERT(owner->mark_dirty_rows_fn(owner->runtime, data, n_tokens));
+        }
     }
 }
 

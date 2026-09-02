@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -278,6 +279,8 @@ private:
         using decode_layout_fn_t = bool (*)(void *, uint32_t);
         using mark_dirty_rows_fn_t = bool (*)(void *, const int64_t *, size_t);
 
+        ggml_backend_dev_t device = nullptr;
+        ggml_backend_buffer_type_t buft = nullptr;
         void * runtime = nullptr;
         void (*free_fn)(void *) = nullptr;
         feedback_fn_t feedback_fn = nullptr;
@@ -304,9 +307,15 @@ private:
         }
     };
 
+    // Adapt a single device's pool; kv_stream_adapt() drives them all.
+    bool kv_stream_adapt_owner(
+        kv_stream_runtime_owner & owner, uint32_t active_tokens, uint32_t query_tokens);
+
     // Declared before ctxs_bufs so the custom buffers release their runtime
-    // references before this owner releases the initial reference.
-    kv_stream_runtime_owner kv_stream_runtime;
+    // references before these owners release the initial reference.
+    // One owner per device: with split-mode layer the attention layers are
+    // spread over several GPUs and each one streams from its own pool.
+    std::vector<std::unique_ptr<kv_stream_runtime_owner>> kv_stream_runtimes;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
