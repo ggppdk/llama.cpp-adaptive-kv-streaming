@@ -54,6 +54,7 @@ set_target_properties(llama PROPERTIES
     VERSION ${LLAMA_VERSION_BASE}
     SOVERSION ${LLAMA_VERSION_MAJOR}
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+    WINDOWS_EXPORT_ALL_SYMBOLS ON # kv-stream unit tests link internal symbols out of llama.dll
 )
 
 target_compile_definitions(llama PRIVATE
