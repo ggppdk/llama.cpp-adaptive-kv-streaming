@@ -2416,13 +2416,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
-        {"--kv-stream-stage-mib"}, "N",
-        string_format("block-streaming KV resident + staging pool in MiB; 0 disables it (default: %u)", params.kv_stream_stage_mib),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("KV stream stage size must be non-negative");
+        {"--kv-stream-stage-mib"}, "N or MiB0,MiB1,...",
+        string_format("block-streaming KV resident + staging pool in MiB; 0 disables it (default: %u).\n"
+            "a single value is the total, split across devices by layer count; a comma-separated\n"
+            "list sets the budget of each device individually, indexed like --tensor-split", params.kv_stream_stage_mib),
+        [](common_params & params, const std::string & value) {
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ value.begin(), value.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.empty()) {
+                throw std::invalid_argument("KV stream stage size must not be empty");
             }
-            params.kv_stream_stage_mib = value;
+            if (split_arg.size() > llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu budgets, but system only has %zu devices",
+                        split_arg.size(), llama_max_devices()));
+            }
+
+            params.kv_stream_stage_mib_split.clear();
+            uint64_t total = 0;
+            for (const auto & arg : split_arg) {
+                const long long mib = std::stoll(arg);
+                if (mib < 0) {
+                    throw std::invalid_argument("KV stream stage size must be non-negative");
+                }
+                params.kv_stream_stage_mib_split.push_back((uint32_t) mib);
+                total += (uint64_t) mib;
+            }
+
+            // a lone value keeps the old meaning: a total to divide by layer count
+            if (params.kv_stream_stage_mib_split.size() == 1) {
+                params.kv_stream_stage_mib_split.clear();
+            } else {
+                params.kv_stream_stage_mib_split.resize(llama_max_devices(), 0);
+            }
+            params.kv_stream_stage_mib = (uint32_t) total;
         }
     ).set_env("LLAMA_ARG_KV_STREAM_STAGE_MIB"));
     add_opt(common_arg(

@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 
 #include <map>
+#include <vector>
 #include <memory>
 #include <functional>
 
@@ -19,6 +20,8 @@ struct llama_memory_params {
     ggml_type type_k;
     ggml_type type_v;
     uint64_t kv_stream_stage_bytes;
+    // per-device budgets in bytes, indexed like tensor_split; empty = split by layer count
+    std::vector<uint64_t> kv_stream_stage_bytes_split;
 
     // use full-size SWA cache
     bool swa_full;

@@ -389,6 +389,9 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
         uint32_t kv_stream_stage_mib; // block-streaming staging budget, 0 = disabled [EXPERIMENTAL]
+        // optional per-device staging budget in MiB, indexed like tensor_split.
+        // NULL splits kv_stream_stage_mib across devices by layer count.
+        const uint32_t * kv_stream_stage_mib_split;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

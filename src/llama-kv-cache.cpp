@@ -82,7 +82,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
-                   size_t   kv_stream_stage_bytes) :
+                   size_t   kv_stream_stage_bytes,
+    const std::vector<uint64_t> & kv_stream_stage_bytes_split) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -334,11 +335,33 @@ llama_kv_cache::llama_kv_cache(
                     const uint32_t dev_layer_count =
                         kv_stream_dev_layers[dev_it - kv_stream_devs.begin()];
 
-                    // Each device gets the share of the pool matching the number of
-                    // layers it hosts, which keeps resident pages per layer even
-                    // across GPUs regardless of how the layers were split.
-                    const size_t dev_stage_bytes = (size_t)
-                        ((uint64_t) kv_stream_stage_bytes*dev_layer_count/kv_stream_layer_count);
+                    // An explicit per-device budget wins. It is indexed like tensor_split,
+                    // so entry i belongs to the i-th device of this backend. Streaming cost
+                    // per byte is not equal across devices - a card on a narrower PCIe link
+                    // stalls longer for the same traffic - so an even split is rarely optimal.
+                    size_t dev_stage_bytes = 0;
+                    bool   dev_stage_explicit = false;
+                    if (!kv_stream_stage_bytes_split.empty()) {
+                        ggml_backend_reg_t dev_reg = ggml_backend_dev_backend_reg(dev);
+                        for (size_t i = 0; i < ggml_backend_reg_dev_count(dev_reg); ++i) {
+                            if (ggml_backend_reg_dev_get(dev_reg, i) != dev) {
+                                continue;
+                            }
+                            if (i < kv_stream_stage_bytes_split.size() &&
+                                    kv_stream_stage_bytes_split[i] != 0) {
+                                dev_stage_bytes   = (size_t) kv_stream_stage_bytes_split[i];
+                                dev_stage_explicit = true;
+                            }
+                            break;
+                        }
+                    }
+
+                    // Otherwise fall back to a share matching the layers this device hosts,
+                    // which keeps resident pages per layer even across GPUs.
+                    if (!dev_stage_explicit) {
+                        dev_stage_bytes = (size_t)
+                            ((uint64_t) kv_stream_stage_bytes*dev_layer_count/kv_stream_layer_count);
+                    }
 
                     auto holder = std::make_unique<kv_stream_runtime_owner>();
                     kv_stream_owner = holder.get();
@@ -362,9 +385,10 @@ llama_kv_cache::llama_kv_cache(
                         throw std::runtime_error("failed to obtain CUDA block KV streaming buffer type");
                     }
 
-                    LLAMA_LOG_INFO("%s: block KV streaming on %s: %u layers, pool = %.2f MiB\n",
+                    LLAMA_LOG_INFO("%s: block KV streaming on %s: %u layers, pool = %.2f MiB (%s)\n",
                             __func__, ggml_backend_dev_name(dev), dev_layer_count,
-                            dev_stage_bytes/1024.0/1024.0);
+                            dev_stage_bytes/1024.0/1024.0,
+                            dev_stage_explicit ? "explicit" : "by layer count");
 
                     kv_stream_runtimes.push_back(std::move(holder));
                 }

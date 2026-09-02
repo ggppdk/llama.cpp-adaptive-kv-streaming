@@ -121,6 +121,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
+    cparams.kv_stream_stage_mib_split = params.kv_stream_stage_mib_split;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -418,10 +419,21 @@ llama_context::llama_context(
                     __func__, kv_stream_stage_bytes/1024.0/1024.0);
         }
 
+        // resolve the optional per-device budgets to bytes
+        std::vector<uint64_t> kv_stream_stage_bytes_split;
+        if (kv_stream_stage_bytes != 0 && cparams.kv_stream_stage_mib_split != nullptr) {
+            kv_stream_stage_bytes_split.resize(llama_max_devices());
+            for (size_t i = 0; i < kv_stream_stage_bytes_split.size(); ++i) {
+                kv_stream_stage_bytes_split[i] =
+                    uint64_t(cparams.kv_stream_stage_mib_split[i])*1024ULL*1024ULL;
+            }
+        }
+
         llama_memory_params params_mem = {
             /*.type_k                =*/ params.type_k,
             /*.type_v                =*/ params.type_v,
             /*.kv_stream_stage_bytes =*/ kv_stream_stage_bytes,
+            /*.kv_stream_bytes_split =*/ std::move(kv_stream_stage_bytes_split),
             /*.swa_full              =*/ params.swa_full,
             /*.ctx_type              =*/ cparams.ctx_type,
             /*.mem_other             =*/ llama_get_memory(cparams.ctx_other),
@@ -3679,6 +3691,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kv_stream_stage_mib         =*/ 0,
+        /*.kv_stream_stage_mib_split   =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
